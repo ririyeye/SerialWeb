@@ -2395,6 +2395,11 @@
       grid-column: 1 / -1;
     }
 
+    #remote-port-field .custom-select-label {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+    }
+
     .baud-rate-anchor {
       position: relative;
       min-width: 0;
@@ -5732,6 +5737,12 @@
           </div>
 
           <div class="config-grid">
+            <div id="remote-port-field" class="field span-4 hidden">
+              <label for="remote-port">远程串口</label>
+              <select id="remote-port">
+                <option value="">正在连接远程服务</option>
+              </select>
+            </div>
             <div class="field">
               <label for="baud-rate">波特率</label>
               <div id="baud-rate-anchor" class="baud-rate-anchor">
@@ -6312,6 +6323,8 @@
         versionModalTitle: document.getElementById('version-modal-title'),
         versionCurrentLabel: document.getElementById('version-current-label'),
         connectBtn: document.getElementById('connect-btn'),
+        remotePortField: document.getElementById('remote-port-field'),
+        remotePort: document.getElementById('remote-port'),
         baudRate: document.getElementById('baud-rate'),
         baudRateAnchor: document.getElementById('baud-rate-anchor'),
         baudRatePresetBtn: document.getElementById('baud-rate-preset-btn'),
@@ -6410,6 +6423,11 @@
         toastLayer: document.getElementById('toast-layer')
       };
 
+      const remoteSerial = {
+        active: false,
+        linkUp: false
+      };
+
       const browserThemeQuery = window.matchMedia('(prefers-color-scheme: dark)');
 
       const initialSavedTheme = (window.__serialWebInitialPrefs && (window.__serialWebInitialPrefs.theme === 'system' || window.__serialWebInitialPrefs.theme === 'dark' || window.__serialWebInitialPrefs.theme === 'light'))
@@ -6422,6 +6440,7 @@
         parserMode: 'text',
         serial: {
           supported: isWebSerialApiAvailable(),
+          remote: false,
           connected: false,
           port: null,
           portHint: null,
@@ -7165,13 +7184,539 @@
         return { kind: 'generic', detail: message || fallback };
       }
 
-      function isWebSerialApiAvailable() {
+      function isNativeWebSerialAvailable() {
         return Boolean(
           navigator?.serial
           && typeof navigator.serial.requestPort === 'function'
           && typeof navigator.serial.getPorts === 'function'
         );
       }
+
+      function isWebSerialApiAvailable() {
+        return Boolean(remoteSerial.active || isNativeWebSerialAvailable());
+      }
+
+      function serialBackend() {
+        if (remoteSerial.active) return remoteSerial;
+        return navigator.serial;
+      }
+
+      function installRemoteSerial() {
+        function toBytes(data) {
+          if (data instanceof Uint8Array) return data;
+          if (ArrayBuffer.isView(data)) {
+            return new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+          }
+          return new Uint8Array(data);
+        }
+
+        function remotePortLabel(port) {
+          const parts = [port.path];
+          if (port.product) parts.push(port.product);
+          else if (port.manufacturer) parts.push(port.manufacturer);
+          if (port.usbVendorId != null && port.usbProductId != null) {
+            const hex = (value) => Number(value).toString(16).toUpperCase().padStart(4, '0');
+            parts.push(hex(port.usbVendorId) + ':' + hex(port.usbProductId));
+          }
+          return parts.join(' · ');
+        }
+
+        function createRxReader() {
+          const reader = {
+            queue: [],
+            pending: null,
+            done: false,
+            push(chunk) {
+              if (reader.done) return;
+              if (reader.pending) {
+                const resolve = reader.pending;
+                reader.pending = null;
+                resolve({ value: chunk, done: false });
+              } else {
+                reader.queue.push(chunk);
+              }
+            },
+            finish() {
+              reader.done = true;
+              reader.queue.length = 0;
+              if (reader.pending) {
+                const resolve = reader.pending;
+                reader.pending = null;
+                resolve({ value: undefined, done: true });
+              }
+            },
+            read() {
+              if (reader.queue.length) {
+                return Promise.resolve({ value: reader.queue.shift(), done: false });
+              }
+              if (reader.done) return Promise.resolve({ value: undefined, done: true });
+              return new Promise((resolve) => {
+                reader.pending = resolve;
+              });
+            },
+            cancel() {
+              reader.finish();
+              return Promise.resolve();
+            },
+            releaseLock() {}
+          };
+          return reader;
+        }
+
+        function createRemotePort(info) {
+          const port = {
+            path: info.path,
+            device: info.device || info.path,
+            product: info.product || '',
+            manufacturer: info.manufacturer || '',
+            usbVendorId: info.vid == null ? null : Number(info.vid),
+            usbProductId: info.pid == null ? null : Number(info.pid),
+            readable: null,
+            writable: null,
+            _readerTaken: false,
+            _writerTaken: false,
+            getInfo() {
+              return {
+                usbVendorId: port.usbVendorId == null ? undefined : port.usbVendorId,
+                usbProductId: port.usbProductId == null ? undefined : port.usbProductId
+              };
+            },
+            open(options) {
+              return remoteSerial.openPort(port, options);
+            },
+            close() {
+              return remoteSerial.closePort(port);
+            },
+            setSignals(signals) {
+              return remoteSerial.setSignals(signals);
+            },
+            getSignals() {
+              return remoteSerial.getSignals();
+            }
+          };
+          return port;
+        }
+
+        Object.assign(remoteSerial, {
+          nextId: 1,
+          pending: new Map(),
+          ports: new Map(),
+          retired: new Map(),
+          listeners: { connect: new Set(), disconnect: new Set() },
+          socket: null,
+          helloSeen: false,
+          everLinked: false,
+          openPath: '',
+          currentPort: null,
+          rxReader: null,
+          earlyRx: [],
+          localClose: false,
+          losing: false,
+          listTimer: 0,
+          addEventListener(type, fn) {
+            if (!remoteSerial.listeners[type]) remoteSerial.listeners[type] = new Set();
+            remoteSerial.listeners[type].add(fn);
+          },
+          emit(type, port) {
+            const event = { type, port, target: port };
+            const set = remoteSerial.listeners[type];
+            if (!set) return;
+            set.forEach((fn) => {
+              try {
+                fn(event);
+              } catch (error) {
+                console.error(error);
+              }
+            });
+          },
+          failPending(message) {
+            const error = new Error(message);
+            remoteSerial.pending.forEach((waiter) => waiter.reject(error));
+            remoteSerial.pending.clear();
+          },
+          rpc(message, timeoutMs = 8000) {
+            if (!remoteSerial.socket || remoteSerial.socket.readyState !== WebSocket.OPEN) {
+              return Promise.reject(new Error('远程串口服务未连接'));
+            }
+            const id = remoteSerial.nextId++;
+            message.id = id;
+            return new Promise((resolve, reject) => {
+              const timer = window.setTimeout(() => {
+                if (!remoteSerial.pending.has(id)) return;
+                remoteSerial.pending.delete(id);
+                reject(new Error('远程串口服务响应超时'));
+              }, timeoutMs);
+              remoteSerial.pending.set(id, {
+                resolve(msg) {
+                  window.clearTimeout(timer);
+                  resolve(msg);
+                },
+                reject(error) {
+                  window.clearTimeout(timer);
+                  reject(error);
+                }
+              });
+              remoteSerial.socket.send(JSON.stringify(message));
+            });
+          },
+          writeBytes(data) {
+            const bytes = toBytes(data);
+            if (!remoteSerial.socket || remoteSerial.socket.readyState !== WebSocket.OPEN) {
+              return Promise.reject(new Error('远程串口服务未连接'));
+            }
+            const id = remoteSerial.nextId++;
+            const frame = new Uint8Array(5 + bytes.length);
+            frame[0] = 0x02;
+            new DataView(frame.buffer).setUint32(1, id >>> 0, true);
+            frame.set(bytes, 5);
+            return new Promise((resolve, reject) => {
+              const timer = window.setTimeout(() => {
+                if (!remoteSerial.pending.has(id)) return;
+                remoteSerial.pending.delete(id);
+                reject(new Error('远程串口写入超时'));
+              }, 8000);
+              remoteSerial.pending.set(id, {
+                resolve(msg) {
+                  window.clearTimeout(timer);
+                  if (msg.t === 'error') reject(new Error(msg.message || '写入失败'));
+                  else resolve(msg);
+                },
+                reject(error) {
+                  window.clearTimeout(timer);
+                  reject(error);
+                }
+              });
+              remoteSerial.socket.send(frame);
+            });
+          },
+          onJson(text) {
+            let msg;
+            try {
+              msg = JSON.parse(text);
+            } catch (error) {
+              return;
+            }
+            if (!msg || typeof msg !== 'object') return;
+            if (msg.id != null && remoteSerial.pending.has(msg.id)) {
+              const waiter = remoteSerial.pending.get(msg.id);
+              remoteSerial.pending.delete(msg.id);
+              if (msg.t === 'error') waiter.reject(new Error(msg.message || '远程串口失败'));
+              else waiter.resolve(msg);
+            }
+            if (msg.t === 'hello') {
+              remoteSerial.helloSeen = true;
+              remoteSerial.applyPortList(msg.ports || [], false);
+            } else if (msg.t === 'ports') {
+              remoteSerial.applyPortList(msg.items || [], true);
+            } else if (msg.t === 'attach' && msg.port) {
+              remoteSerial.upsertPort(msg.port, true);
+            } else if (msg.t === 'detach' && msg.path) {
+              remoteSerial.removePort(msg.path);
+            } else if (msg.t === 'closed' && msg.reason === 'lost' && msg.id == null && !remoteSerial.localClose) {
+              remoteSerial.noteLost();
+            }
+          },
+          onBinary(buffer) {
+            const bytes = buffer instanceof ArrayBuffer ? new Uint8Array(buffer) : toBytes(buffer);
+            if (bytes.length < 9 || bytes[0] !== 0x01) return;
+            const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+            const timestamp = Number(view.getBigUint64(1, true));
+            const payload = bytes.slice(9);
+            payload.remoteTimestampMs = timestamp;
+            if (remoteSerial.rxReader) remoteSerial.rxReader.push(payload);
+            else remoteSerial.earlyRx.push(payload);
+          },
+          findKnownPort(info) {
+            return remoteSerial.ports.get(info.path)
+              || remoteSerial.retired.get(info.path)
+              || (info.device ? remoteSerial.retired.get('dev:' + info.device) : null)
+              || null;
+          },
+          upsertPort(info, announce, quiet) {
+            if (!info || !info.path) return;
+            let port = remoteSerial.findKnownPort(info);
+            const liveBefore = Boolean(port && (remoteSerial.ports.get(port.path) === port || remoteSerial.ports.get(info.path) === port));
+            if (!port) {
+              port = createRemotePort(info);
+            } else {
+              remoteSerial.ports.delete(port.path);
+              port.path = info.path;
+              port.device = info.device || port.device;
+              port.product = info.product || '';
+              port.manufacturer = info.manufacturer || '';
+              if (info.vid != null) port.usbVendorId = Number(info.vid);
+              if (info.pid != null) port.usbProductId = Number(info.pid);
+            }
+            remoteSerial.ports.set(info.path, port);
+            remoteSerial.retired.set(info.path, port);
+            if (port.device) remoteSerial.retired.set('dev:' + port.device, port);
+            if (!quiet) remoteSerial.renderPorts();
+            if (announce && !liveBefore) remoteSerial.emit('connect', port);
+          },
+          removePort(path, quiet) {
+            const port = remoteSerial.ports.get(path);
+            if (!port) return;
+            remoteSerial.ports.delete(path);
+            remoteSerial.retired.set(path, port);
+            if (port.device) remoteSerial.retired.set('dev:' + port.device, port);
+            if (!quiet) remoteSerial.renderPorts();
+            if (remoteSerial.openPath === path) {
+              remoteSerial.noteLost();
+              return;
+            }
+            if (!state.serial.connected) remoteSerial.emit('disconnect', port);
+          },
+          applyPortList(items, announce) {
+            const seen = new Set();
+            (items || []).forEach((info) => {
+              if (!info || !info.path) return;
+              const existed = remoteSerial.ports.has(info.path);
+              seen.add(info.path);
+              remoteSerial.upsertPort(info, announce && !existed, true);
+            });
+            [...remoteSerial.ports.keys()].forEach((path) => {
+              if (!seen.has(path)) remoteSerial.removePort(path, true);
+            });
+            remoteSerial.renderPorts();
+          },
+          renderPorts() {
+            const select = refs.remotePort;
+            if (!select) return;
+            const signature = [...remoteSerial.ports.values()].map((port) => port.path + '\t' + remotePortLabel(port)).join('\n')
+              + '\n' + (remoteSerial.linkUp ? '1' : '0');
+            if (signature === remoteSerial.portSignature) return;
+            remoteSerial.portSignature = signature;
+            const previous = select.value;
+            const ports = [...remoteSerial.ports.values()];
+            select.replaceChildren();
+            if (!ports.length) {
+              const option = document.createElement('option');
+              option.value = '';
+              option.textContent = remoteSerial.linkUp ? '没有发现串口' : '正在连接远程服务';
+              select.appendChild(option);
+            } else {
+              ports.forEach((port) => {
+                const option = document.createElement('option');
+                option.value = port.path;
+                option.textContent = remotePortLabel(port);
+                select.appendChild(option);
+              });
+              const still = ports.some((port) => port.path === previous);
+              select.value = still ? previous : ports[0].path;
+            }
+            select.disabled = !remoteSerial.linkUp;
+            ensureCustomSelect(select);
+          },
+          noteLost() {
+            if (remoteSerial.losing) return;
+            const port = remoteSerial.currentPort;
+            if (!port && !remoteSerial.openPath) return;
+            remoteSerial.losing = true;
+            remoteSerial.openPath = '';
+            remoteSerial.currentPort = null;
+            remoteSerial.rxReader?.finish();
+            remoteSerial.rxReader = null;
+            if (port) remoteSerial.emit('disconnect', port);
+            remoteSerial.losing = false;
+          },
+          async openPort(port, options) {
+            const reader = createRxReader();
+            remoteSerial.rxReader = reader;
+            remoteSerial.earlyRx.forEach((chunk) => reader.push(chunk));
+            remoteSerial.earlyRx = [];
+            port._readerTaken = false;
+            port._writerTaken = false;
+            port.readable = {
+              getReader() {
+                if (port._readerTaken) throw new DOMException('ReadableStream is locked', 'InvalidStateError');
+                port._readerTaken = true;
+                return reader;
+              }
+            };
+            port.writable = {
+              getWriter() {
+                if (port._writerTaken) throw new DOMException('WritableStream is locked', 'InvalidStateError');
+                port._writerTaken = true;
+                return {
+                  ready: Promise.resolve(),
+                  write(data) {
+                    return remoteSerial.writeBytes(data);
+                  },
+                  releaseLock() {
+                    port._writerTaken = false;
+                  }
+                };
+              }
+            };
+            try {
+              const reply = await remoteSerial.rpc({
+                t: 'open',
+                path: port.path,
+                baudRate: options.baudRate,
+                dataBits: options.dataBits,
+                stopBits: options.stopBits,
+                parity: options.parity,
+                flowControl: options.flowControl
+              });
+              remoteSerial.openPath = port.path;
+              remoteSerial.currentPort = port;
+              remoteSerial.losing = false;
+              if (reply.vid != null) port.usbVendorId = Number(reply.vid);
+              if (reply.pid != null) port.usbProductId = Number(reply.pid);
+              if (reply.product) port.product = reply.product;
+              return reply;
+            } catch (error) {
+              reader.finish();
+              if (remoteSerial.rxReader === reader) remoteSerial.rxReader = null;
+              port.readable = null;
+              port.writable = null;
+              throw error;
+            }
+          },
+          async closePort(port) {
+            remoteSerial.localClose = true;
+            try {
+              if (remoteSerial.linkUp) await remoteSerial.rpc({ t: 'close' });
+            } catch (error) {
+              console.warn('remote close failed', error);
+            } finally {
+              remoteSerial.localClose = false;
+              if (remoteSerial.currentPort === port) {
+                remoteSerial.openPath = '';
+                remoteSerial.currentPort = null;
+              }
+              remoteSerial.rxReader?.finish();
+              remoteSerial.rxReader = null;
+            }
+          },
+          setSignals(signals) {
+            const body = { t: 'setSignals' };
+            if (typeof signals?.dataTerminalReady === 'boolean') body.dtr = signals.dataTerminalReady;
+            if (typeof signals?.requestToSend === 'boolean') body.rts = signals.requestToSend;
+            if (typeof signals?.break === 'boolean') body.break = signals.break;
+            return remoteSerial.rpc(body);
+          },
+          async getSignals() {
+            const msg = await remoteSerial.rpc({ t: 'getSignals' });
+            const flag = (value) => (typeof value === 'boolean' ? value : undefined);
+            return {
+              clearToSend: flag(msg.cts),
+              dataSetReady: flag(msg.dsr),
+              dataCarrierDetect: flag(msg.dcd),
+              ringIndicator: flag(msg.ri)
+            };
+          },
+          refreshPorts() {
+            return remoteSerial.rpc({ t: 'list' });
+          },
+          async requestPort() {
+            if (!remoteSerial.linkUp) {
+              const error = new Error('远程串口服务未连接');
+              error.name = 'NetworkError';
+              throw error;
+            }
+            try {
+              await remoteSerial.refreshPorts();
+            } catch (error) {
+              console.warn('refresh remote ports failed', error);
+            }
+            const path = refs.remotePort?.value || '';
+            const port = remoteSerial.ports.get(path);
+            if (!port) {
+              toast('未选择串口', '请先在「远程串口」里选择调试机上的端口。', 'warn');
+              throw new DOMException('未选择串口设备', 'NotFoundError');
+            }
+            return port;
+          },
+          async getPorts() {
+            try {
+              if (remoteSerial.linkUp) await remoteSerial.refreshPorts();
+            } catch (error) {
+              console.warn('list remote ports failed', error);
+            }
+            return [...remoteSerial.ports.values()];
+          },
+          connectSocket() {
+            if (
+              remoteSerial.socket
+              && (remoteSerial.socket.readyState === WebSocket.OPEN || remoteSerial.socket.readyState === WebSocket.CONNECTING)
+            ) {
+              return Promise.resolve();
+            }
+            return new Promise((resolve) => {
+              let settled = false;
+              const done = () => {
+                if (settled) return;
+                settled = true;
+                resolve();
+              };
+              const timer = window.setTimeout(done, 4000);
+              const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+              const socket = new WebSocket(proto + '//' + window.location.host + '/api/serial');
+              socket.binaryType = 'arraybuffer';
+              remoteSerial.socket = socket;
+              remoteSerial.helloSeen = false;
+              socket.onopen = () => {
+                const recovered = remoteSerial.everLinked && !remoteSerial.linkUp;
+                remoteSerial.linkUp = true;
+                remoteSerial.everLinked = true;
+                state.serial.supported = true;
+                state.serial.remote = true;
+                remoteSerial.renderPorts();
+                updateSerialStatus();
+                if (recovered) addSystemLog('远程串口服务已恢复。', 'meta');
+                if (state.serial.reconnectWanted) wakeReconnectLoop();
+              };
+              socket.onmessage = (event) => {
+                if (typeof event.data === 'string') {
+                  const wasHello = remoteSerial.helloSeen;
+                  remoteSerial.onJson(event.data);
+                  if (!wasHello && remoteSerial.helloSeen) {
+                    window.clearTimeout(timer);
+                    done();
+                  }
+                } else {
+                  remoteSerial.onBinary(event.data);
+                }
+              };
+              socket.onerror = () => {};
+              socket.onclose = () => {
+                if (remoteSerial.socket !== socket) return;
+                remoteSerial.linkUp = false;
+                remoteSerial.helloSeen = false;
+                remoteSerial.socket = null;
+                remoteSerial.failPending('远程串口服务已断开');
+                if (remoteSerial.openPath || remoteSerial.currentPort) remoteSerial.noteLost();
+                state.serial.supported = false;
+                remoteSerial.renderPorts();
+                updateSerialStatus();
+                window.clearTimeout(timer);
+                done();
+                if (remoteSerial.active) {
+                  window.setTimeout(() => {
+                    if (!remoteSerial.socket) remoteSerial.connectSocket();
+                  }, 1000);
+                }
+              };
+            });
+          },
+          async start() {
+            remoteSerial.active = true;
+            state.serial.remote = true;
+            refs.remotePortField?.classList.remove('hidden');
+            remoteSerial.renderPorts();
+            if (!remoteSerial.listTimer) {
+              remoteSerial.listTimer = window.setInterval(() => {
+                if (remoteSerial.linkUp) remoteSerial.refreshPorts().catch(() => {});
+              }, 3000);
+            }
+            await remoteSerial.connectSocket();
+            updateSerialStatus();
+          }
+        });
+      }
+
+      installRemoteSerial();
 
       function getUnifiedConnectionFailureDetail() {
         return '串口可能被占用，请关闭其他串口软件后重试';
@@ -8283,12 +8828,47 @@
 
       function addInitialWebSerialStatusLog() {
         state.serial.supported = isWebSerialApiAvailable();
+        updateSerialStatus();
+      }
+
+      function finishTransportDetection() {
+        if (remoteSerial.active) {
+          state.serial.remote = true;
+          if (remoteSerial.linkUp) {
+            state.serial.supported = true;
+            addSystemLog('远程串口服务已就绪，发现 ' + remoteSerial.ports.size + ' 个串口。', 'meta');
+          } else {
+            state.serial.supported = false;
+            addSystemLog('远程串口服务暂时连不上，正在重试。', 'error');
+          }
+          updateSerialStatus();
+          return;
+        }
+        state.serial.remote = false;
+        state.serial.supported = isNativeWebSerialAvailable();
         if (state.serial.supported) {
           addSystemLog('Web Serial API 已就绪，等待连接。', 'meta');
         } else {
           addSystemLog(`不支持 Web Serial API。推荐使用 Chrome 或 Edge，并访问在线最新版本：${ONLINE_VERSION_URL}`, 'error');
         }
         updateSerialStatus();
+      }
+
+      async function probeRemoteSerial() {
+        if (window.location.protocol === 'file:') return;
+        const controller = new AbortController();
+        const timer = window.setTimeout(() => controller.abort(), 2000);
+        try {
+          const response = await fetch('/api/transport', { cache: 'no-store', signal: controller.signal });
+          if (!response.ok) return;
+          const payload = await response.json();
+          if (!payload || payload.mode !== 'rust') return;
+          await remoteSerial.start();
+        } catch (error) {
+          console.warn('remote serial probe skipped', error);
+        } finally {
+          window.clearTimeout(timer);
+        }
       }
 
       let serialWebViewTracked = false;
@@ -8835,7 +9415,9 @@
         refs.serialStatusDot.className = `status-dot ${state.serial.connected ? 'connected' : (state.serial.supported ? 'warn' : 'offline')}`;
         refs.serialStatusText.textContent = state.serial.connected
           ? '串口已连接'
-          : (state.serial.supported ? '就绪，等待连接' : '不支持 Web Serial API');
+          : (state.serial.supported
+            ? (state.serial.remote ? '远程服务已就绪' : '就绪，等待连接')
+            : (state.serial.remote ? '远程服务未连接' : '不支持 Web Serial API'));
         refs.deviceVid.textContent = state.serial.deviceInfo.vid;
         refs.devicePid.textContent = state.serial.deviceInfo.pid;
         const hintActive = Date.now() < state.ui.connectHintUntil && !!state.ui.connectHintText;
@@ -8846,8 +9428,10 @@
         refs.connectBtn.classList.toggle('is-release-hold', releaseActive || reconnecting);
         refs.connectBtn.classList.toggle('is-hint-error', !state.serial.supported || (hintActive && state.ui.connectHintKind === 'error'));
         if (!state.serial.supported) {
-          refs.connectBtn.textContent = '不支持 Web Serial API';
-          refs.connectBtn.title = `推荐使用 Chrome 或 Edge，并访问在线最新版本：${ONLINE_VERSION_URL}`;
+          refs.connectBtn.textContent = state.serial.remote ? '远程串口未连接' : '不支持 Web Serial API';
+          refs.connectBtn.title = state.serial.remote
+            ? '正在连接调试机上的串口服务'
+            : `推荐使用 Chrome 或 Edge，并访问在线最新版本：${ONLINE_VERSION_URL}`;
           updateSignalControlsUI();
           return;
         }
@@ -9415,7 +9999,7 @@
           port = state.serial.reconnectCandidate;
           state.serial.reconnectCandidate = null;
         } else {
-          const ports = await navigator.serial.getPorts();
+          const ports = await serialBackend().getPorts();
           if (state.serial.reconnectSession !== session || !state.serial.reconnectWanted) return false;
           const usablePorts = physicalReconnect
             ? ports.filter((item) => item !== state.serial.disconnectedPortRef)
@@ -9464,7 +10048,11 @@
 
       async function connectSerial(source = 'manual', preferredPort = null, reconnectSession = 0) {
         if (!state.serial.supported) {
-          toast('不支持 Web Serial API', `推荐使用 Chrome 或 Edge，并访问在线最新版本：${ONLINE_VERSION_URL}`, 'error');
+          if (state.serial.remote) {
+            toast('远程串口未连接', '正在连接调试机上的串口服务，请稍候再试。', 'error');
+          } else {
+            toast('不支持 Web Serial API', `推荐使用 Chrome 或 Edge，并访问在线最新版本：${ONLINE_VERSION_URL}`, 'error');
+          }
           return false;
         }
 
@@ -9472,8 +10060,9 @@
         try {
           const options = getSerialOpenOptions({ commit: true });
           syncSerialOptionState(options);
+          const backend = serialBackend();
           port = source === 'manual'
-            ? await navigator.serial.requestPort()
+            ? await backend.requestPort()
             : (preferredPort || state.serial.portHint);
           if (!port) return false;
           state.serial.port = port;
@@ -9513,7 +10102,8 @@
           await applySerialSignalOutputs();
           startSerialSignalPolling();
           syncAutoSendRuntime();
-          addSystemLog('串口已连接，波特率 ' + options.baudRate + '。', 'meta');
+          const portLabel = port?.path ? '，' + port.path : '';
+          addSystemLog('串口已连接，波特率 ' + options.baudRate + portLabel + '。', 'meta');
           readLoop();
           if (!isSerialOptionsApplyReason(source)) {
             const latestSignature = getSerialOpenOptionsSignature(getSerialOpenOptions());
@@ -9722,7 +10312,7 @@
             }
             if (value && value.byteLength) {
               const bytes = value instanceof Uint8Array ? value : new Uint8Array(value);
-              const timestamp = nowPreciseMs();
+              const timestamp = Number.isFinite(bytes.remoteTimestampMs) ? bytes.remoteTimestampMs : nowPreciseMs();
               try {
                 queueRxBytes(bytes, timestamp, { source: 'serial-read' });
               } catch (processingError) {
@@ -9971,7 +10561,7 @@
       async function tryInitialSerialConnectPrompt() {
         if (!state.serial.supported || state.serial.connected) return;
         try {
-          const authorizedPorts = await navigator.serial.getPorts();
+          const authorizedPorts = await serialBackend().getPorts();
           if (authorizedPorts.length === 1) {
             await connectSerial('auto-initial', authorizedPorts[0]);
           }
@@ -16267,28 +16857,35 @@
           });
         });
 
-        if (navigator.serial?.addEventListener) {
-          navigator.serial.addEventListener('disconnect', async (event) => {
-            const port = event?.target || event?.port || null;
-            if (port && state.serial.portHint && port === state.serial.portHint) {
-              state.serial.reconnectCandidate = null;
-            }
-            if (state.serial.connected) {
-              await disconnectSerial('lost');
-            }
-          });
-          navigator.serial.addEventListener('connect', (event) => {
-            const port = event?.target || event?.port || null;
-            if (port) {
-              state.serial.reconnectCandidate = port;
-              if (!state.serial.portInfoHint) cachePortInfoHint(port);
-            }
-            if (!state.serial.connected && (state.serial.portHint || state.serial.reconnectCandidate) && !state.serial.blurReleaseActive) {
-              state.serial.reconnectPending = true;
-              scheduleReconnect('auto');
-            }
-          });
-        }
+      }
+
+      let serialHardwareEventsBound = false;
+
+      function bindSerialHardwareEvents() {
+        if (serialHardwareEventsBound) return;
+        const api = serialBackend();
+        if (!api || typeof api.addEventListener !== 'function') return;
+        serialHardwareEventsBound = true;
+        api.addEventListener('disconnect', async (event) => {
+          const port = event?.target || event?.port || null;
+          if (port && state.serial.portHint && port === state.serial.portHint) {
+            state.serial.reconnectCandidate = null;
+          }
+          if (state.serial.connected) {
+            await disconnectSerial('lost');
+          }
+        });
+        api.addEventListener('connect', (event) => {
+          const port = event?.target || event?.port || null;
+          if (port) {
+            state.serial.reconnectCandidate = port;
+            if (!state.serial.portInfoHint) cachePortInfoHint(port);
+          }
+          if (!state.serial.connected && (state.serial.portHint || state.serial.reconnectCandidate) && !state.serial.blurReleaseActive) {
+            state.serial.reconnectPending = true;
+            scheduleReconnect('auto');
+          }
+        });
       }
 
       function initializeDefaults() {
@@ -16367,9 +16964,15 @@
       });
 
       initializeDefaults();
+      if (refs.connectBtn) refs.connectBtn.disabled = true;
       attachEventListeners();
       trackSerialWebView();
-      tryInitialSerialConnectPrompt();
+      probeRemoteSerial().finally(() => {
+        if (refs.connectBtn) refs.connectBtn.disabled = false;
+        finishTransportDetection();
+        bindSerialHardwareEvents();
+        tryInitialSerialConnectPrompt();
+      });
     })();
   </script>
 <!-- AI-PROMPT:BEGIN -->
